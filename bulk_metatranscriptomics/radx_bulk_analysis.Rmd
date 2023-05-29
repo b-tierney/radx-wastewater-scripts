@@ -1,0 +1,758 @@
+---
+title: "radx_bulk_analysis"
+author: "Braden T Tierney"
+date: '2022-06-17'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+reprocess xtree
+add xtree fungal
+
+
+```{r}
+# LOAD ALL DATA 
+library(tidyverse)
+library(ggtree)
+library(umap)
+library(ComplexHeatmap)
+library(ggbeeswarm)
+library(ComplexUpset)
+library(tidytext)
+library(circlize)
+library(vegan)
+library(ggraph)
+library(broom)
+library(reshape2)
+library(igraph)
+library(ggrepel)
+library(broom)
+library(ggpubr)
+library(ape)
+library(phytools)
+```
+
+```{r}
+### KRAKEN
+brackout = read.csv('~/Dropbox (Mason Lab)/radx/data_packet_feb23/kraken_data_masked/wawa_bracken_merged_masked.tsv',sep='\t',header=T)
+brackout_num = brackout %>% select(name,taxonomy_id,all_of(grep('num',colnames(.))))
+colnames(brackout_num) = gsub('.masked.bracken_num','',colnames(brackout_num))
+brackout_frac = brackout %>% select(name,taxonomy_id,all_of(grep('frac',colnames(.))))
+colnames(brackout_frac) = gsub('.masked.bracken_frac','',colnames(brackout_frac))
+
+toremove = brackout_num %>% filter(Negative.Control_Extraction_Batch06>quantile(brackout_num$Negative.Control_Extraction_Batch06,.75)) %>% select(taxonomy_id) %>% unlist %>% unname
+brackout_num = brackout_num %>% filter(!(taxonomy_id %in% toremove))
+
+toremove = brackout_frac %>% filter(Negative.Control_Extraction_Batch06>quantile(brackout_frac$Negative.Control_Extraction_Batch06,.75)) %>% select(taxonomy_id) %>% unlist %>% unname
+brackout_frac = brackout_frac %>% filter(!(taxonomy_id %in% toremove))
+
+# map tax id to 
+taxmap = taxonomizr::getTaxonomy(brackout_num$taxonomy_id,sqlFile = '~/Dropbox (Mason Lab)/i4/i4_data_packet/accessionTaxa.sql') %>% data.frame %>%rownames_to_column('taxonomy_id') %>% filter(!(is.na(superkingdom))) %>% select(taxonomy_id,superkingdom,species) 
+taxmap$taxonomy_id=as.numeric(taxmap$taxonomy_id)
+
+brackout_frac_king = inner_join(brackout_frac,taxmap %>% select(taxonomy_id,superkingdom))%>% select(-taxonomy_id,-name)%>% melt %>% group_by(superkingdom,variable) %>% summarise(value = sum(value))%>% filter(variable!="Negative.Control_Extraction_Batch06",variable!='Positive.Control_Extraction_Batch06')
+brackout_num_king = inner_join(brackout_num,taxmap%>% select(taxonomy_id,superkingdom))%>% select(-taxonomy_id,-name)%>% melt %>% group_by(superkingdom,variable) %>% summarise(value = sum(value))%>% filter(variable!="Negative.Control_Extraction_Batch06",variable!='Positive.Control_Extraction_Batch06')
+
+brackout_frac = inner_join(brackout_frac,taxmap %>% select(taxonomy_id,superkingdom,species))%>% select(-taxonomy_id,-name) %>% melt %>% filter(variable!="Negative.Control_Extraction_Batch06",variable!='Positive.Control_Extraction_Batch06')
+brackout_num = inner_join(brackout_num,taxmap%>% select(taxonomy_id,superkingdom,species))%>% select(-taxonomy_id,-name)%>% melt %>% filter(variable!="Negative.Control_Extraction_Batch06",variable!='Positive.Control_Extraction_Batch06')
+
+brackout_frac_king = brackout_frac %>% mutate(variable=gsub('_B06','',variable)) 
+brackout_num_king = brackout_num %>% mutate(variable=gsub('_B06','',variable)) 
+
+brackout_frac = brackout_frac %>% mutate(variable=gsub('_B06','',variable)) 
+brackout_num = brackout_num %>% mutate(variable=gsub('_B06','',variable)) 
+
+# bracken species
+brackout_frac_bac = brackout_frac %>% filter(superkingdom == 'Bacteria') %>% select(-superkingdom)
+brackout_num_bac = brackout_num %>% filter(superkingdom == 'Bacteria') %>% select(-superkingdom)
+
+# bracken vir
+brackout_frac_vir = brackout_frac %>% filter(superkingdom == 'Viruses') %>% select(-superkingdom)
+brackout_num_vir = brackout_num %>% filter(superkingdom == 'Viruses') %>% select(-superkingdom)
+
+# bracken euk
+brackout_frac_euk = brackout_frac %>% filter(superkingdom == 'Eukaryota') %>% select(-superkingdom)
+brackout_num_euk = brackout_num %>% filter(superkingdom == 'Eukaryota') %>% select(-superkingdom)
+
+### METAPHLAN
+metaph = read.table('~/Dropbox (Mason Lab)/radx/data_packet_feb23/metaphlan/merged_metaphlan_data.tsv',sep='\t',header=T) %>% filter(grepl('k__Bacteria',clade_name))%>% filter(grepl('s__',clade_name))%>% filter(!grepl('t__',clade_name)) %>% mutate(species = strsplit(clade_name,'s__') %>% map_chr(2) %>% gsub('_',' ',.)) %>% select(-clade_name)
+colnames(metaph) = gsub('_metaphlan','',colnames(metaph)) 
+toremove = metaph %>% filter(Negative.Control_Extraction_Batch06>quantile(metaph$Negative.Control_Extraction_Batch06,.75)) %>% select(species) %>% unlist %>% unname
+metaph = metaph %>% filter(!(species %in% toremove))%>% melt %>% filter(variable!="Negative.Control_Extraction_Batch06",variable!='Positive.Control_Extraction_Batch06')
+
+### XTREE BAC
+xtree_bac = read.delim('~/Dropbox (Mason Lab)/radx/data_packet_feb23/xtree/bacterial/GTDB_.01_.0.005_metatranscriptomics_species_ra.tsv')
+xtree_bac = xtree_bac[rownames(xtree_bac)!='Unknown',] 
+xtree_bac = xtree_bac[,colSums(xtree_bac)!=0]
+xtree_bac = xtree_bac %>% t %>% data.frame(check.names=F) %>%  rownames_to_column('sample_id')
+xtree_bac = xtree_bac %>% mutate(sample_id=gsub('_B06','',sample_id)) %>% column_to_rownames('sample_id') %>% t %>% data.frame %>% rownames_to_column('clade_name')
+xtree_bac = xtree_bac %>% mutate(species = strsplit(clade_name,';s__') %>% map_chr(2)) %>% select(-clade_name) 
+toremove = xtree_bac %>% filter(Negative.Control_Extraction_Batch06>quantile(xtree_bac$Negative.Control_Extraction_Batch06,.75)) %>% select(species) %>% unlist %>% unname
+xtree_bac = xtree_bac %>% filter(!(species %in% toremove))%>% melt %>% filter(variable!="Negative.Control_Extraction_Batch06",variable!='Positive.Control_Extraction_Batch06')
+
+
+### XTREE BAC -- FAMILY
+xtree_bac_family = read.delim('~/Dropbox (Mason Lab)/radx/data_packet_feb23/xtree/bacterial/GTDB_.01_.0.005_6_metatranscriptomics_ra.tsv')
+xtree_bac_family = xtree_bac_family[rownames(xtree_bac_family)!='Unknown',] 
+xtree_bac_family = xtree_bac_family[,colSums(xtree_bac_family)!=0]
+xtree_bac_family = xtree_bac_family %>% t %>% data.frame(check.names=F) %>%  rownames_to_column('sample_id')
+xtree_bac_family = xtree_bac_family %>% mutate(sample_id=gsub('_B06','',sample_id)) %>% column_to_rownames('sample_id') %>% t %>% data.frame %>% rownames_to_column('clade_name')
+#xtree_bac_family = xtree_bac_family %>% mutate(species = strsplit(clade_name,';s__') %>% map_chr(2)) %>% select(-clade_name) 
+toremove = xtree_bac_family %>% filter(Negative.Control_Extraction_Batch06>quantile(xtree_bac_family$Negative.Control_Extraction_Batch06,.75)) %>% select(clade_name) %>% unlist %>% unname
+xtree_bac_family = xtree_bac_family %>% filter(!(clade_name %in% toremove))%>% melt %>% filter(variable!="Negative.Control_Extraction_Batch06",variable!='Positive.Control_Extraction_Batch06')
+
+### XTREE VIR
+xtree_vir = read.delim('~/Dropbox (Mason Lab)/radx/data_packet_feb23/xtree/viral/vir_.2_.0.1_metatranscriptomics_species_ra.tsv')
+xtree_vir = xtree_vir[rownames(xtree_vir)!='Unknown',] 
+xtree_vir = xtree_vir[,colSums(xtree_vir)!=0]
+xtree_vir = xtree_vir %>% t %>% data.frame(check.names=F) %>%  rownames_to_column('sample_id')
+xtree_vir = xtree_vir %>% mutate(sample_id=gsub('_B06','',sample_id)) %>% column_to_rownames('sample_id') %>% t %>% data.frame %>% rownames_to_column('species')
+#toremove = xtree_vir %>% filter(Negative.Control_Extraction_Batch06>quantile(xtree_vir$Negative.Control_Extraction_Batch06,.75)) %>% select(species) %>% unlist %>% unname
+xtree_vir = xtree_vir %>% filter(!(species %in% toremove))%>% melt %>% filter(variable!="Negative.Control_Extraction_Batch06",variable!='Positive.Control_Extraction_Batch06')
+#filter out partial genomes
+xtree_vir = xtree_vir %>% filter(!grepl('segment',species),!grepl('hypothetical',species),!grepl('gene',species),!grepl('partial',species))
+
+### XTREE EUK
+xtree_euk = read.delim('~/Dropbox (Mason Lab)/radx/data_packet_feb23/xtree/euk/euk_.01_.0.005_metatranscriptomics_species_ra.tsv')
+rownames(xtree_euk) = sub(".*? ", "", rownames(xtree_euk))
+xtree_euk = xtree_euk[rownames(xtree_euk)!='Unknown',] 
+xtree_euk = xtree_euk[,colSums(xtree_euk)!=0]
+xtree_euk = xtree_euk %>% t %>% data.frame(check.names=F) %>%  rownames_to_column('sample_id')
+xtree_euk = xtree_euk %>% mutate(sample_id=gsub('_B06','',sample_id)) %>% column_to_rownames('sample_id') %>% t %>% data.frame %>% rownames_to_column('species')
+toremove = xtree_euk %>% filter(Negative.Control_Extraction_Batch06>quantile(xtree_euk$Negative.Control_Extraction_Batch06,.75)) %>% select(species) %>% unlist %>% unname
+xtree_euk = xtree_euk %>% filter(!(species %in% toremove))%>% melt %>% filter(variable!="Negative.Control_Extraction_Batch06",variable!='Positive.Control_Extraction_Batch06')
+
+# load metadata
+mdat = read.csv('~/Dropbox (Mason Lab)/radx/bulk/bulk_metadata.csv')# %>% filter(sample_category_wastewater == 'WEEKLY')
+mdat$sampling.date = as.Date(mdat$sampling.date)
+mdat$month = month.abb[as.numeric(format(mdat$sampling.date, "%m") )]
+mdat$month = factor(mdat$month,levels = c('Sep','Oct','Nov','Dec','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug'))
+mdat$month2 = mdat$month
+levels(mdat$month) = c(9,10,11,12,1,2,3,4,5,6,7,8)
+
+locationmap = read.csv('~/Dropbox (Mason Lab)/radx/location_mapping_radx_TB.csv')
+locationmap$NAME=toupper(locationmap$NAME)
+mdat$site_name = toupper(mdat$site_name)
+mdat = inner_join(mdat,locationmap,by=c('site_name'='NAME'))
+
+mdat$month = as.numeric(as.character(mdat$month))
+
+mdat = mdat %>% arrange(month)
+
+mdat$month_norm = 2 * pi * mdat$month / max(mdat$month,na.rm=T)
+mdat$month_cyclical = cos(mdat$month_norm)
+```
+### TREE
+```{r}
+mergedata <- function(data){
+  data1 = data %>% filter(grepl('SL',variable))
+  merged1 = inner_join(data1,mdat,by=c('variable'='ha_sample_id'))
+  data2 = data %>% filter(!grepl('SL',variable)) %>% mutate(variable= gsub('\\.','-',variable))
+  merged2 = inner_join(data2,mdat,by=c('variable'='sample_id'))
+  merged1 = bind_rows(merged1,merged2) %>% filter(site_name_description!='n/a')
+  return(merged1)
+}
+
+#GTDB TREE
+setwd('~/Dropbox (Mason Lab)/radx/data_packet_feb23/xtree')
+# load tree
+tree = ggtree::read.tree('bac120.tree')
+tree$tip.label = gsub('GB_','',tree$tip.label)
+tree$tip.label = gsub('RS_','',tree$tip.label)
+
+# load tree tip mapping file
+mapfile = read.delim('xtree_all_db_mapping',sep='\t',header=F) %>% filter(grepl('GC',V1)) %>% mutate(species = strsplit(V2,';') %>% map_chr(7) %>% gsub('s__','',.),genus = strsplit(V2,';') %>% map_chr(6) %>% gsub('g__','',.),family = strsplit(V2,';') %>% map_chr(5) %>% gsub('f__','',.),order = strsplit(V2,';') %>% map_chr(4) %>% gsub('o__','',.),class = strsplit(V2,';') %>% map_chr(3) %>% gsub('c__','',.),phylum = strsplit(V2,';') %>% map_chr(2) %>% gsub('p__','',.)) %>% filter(species %in% xtree_bac$species) 
+mapfile= mapfile %>% group_by(family)%>% sample_n(size=1)%>% ungroup 
+
+# filter tree and mapping file for appropriate species
+mapfile = mapfile %>% filter(V1 %in% intersect(mapfile$V1,tree$tip.label)) %>% column_to_rownames("V1")
+tree = keep.tip(tip = intersect(rownames(mapfile),tree$tip.label),phy = tree)
+mapfile = mapfile[tree$tip.label,]
+
+tree$tip.label = mapfile$family
+
+# within each site, compute average abundance of each family
+mdat_xtree_bac = mergedata(xtree_bac_family) 
+mdat_xtree_bac = mdat_xtree_bac %>% group_by(clade_name,LOCATION_TYPE) %>% summarise(mean = mean(value)) %>% mutate(family = strsplit(clade_name,';') %>% map_chr(5) %>% gsub('f__','',.))
+mdat_xtree_bac_wide = mdat_xtree_bac %>% reshape2::dcast(family ~ LOCATION_TYPE,value.var= 'mean') %>% select(family,"Hospital/Medical Campus","Dormitory","University Campus","Wastewater Treatment Plant") #%>% column_to_rownames('genus')
+
+# once again filter tips for genera that got lost
+mdat_xtree_bac_wide_family = mdat_xtree_bac_wide %>% filter(family %in% mapfile$family)
+mapfile = mapfile %>% filter(family %in% mdat_xtree_bac_wide$family)
+tree = keep.tip(tip = mapfile$family,phy = tree)
+mdat_xtree_bac_wide_family = mdat_xtree_bac_wide_family %>% column_to_rownames('family')
+#mapfile = mapfile %>% column_to_rownames('genus')
+mdat_xtree_bac_wide_family = mdat_xtree_bac_wide_family[tree$tip.label,]
+
+#rename nodes
+#bing = tree$node.label %>% data.frame %>% mutate(baz = if_else(grepl('o__',.),.,'none:none')) %>% mutate(bing = if_else(!grepl('f__',baz),baz,'none:none')) 
+#tree$node.label = bing$bing %>% strsplit(':') %>% map_chr(2) %>% gsub('none','',.)%>% gsub('o__','',.)
+
+# label average abundance in rings
+
+mapfile = mapfile %>% mutate(phylum = if_else(phylum %in% (mapfile$phylum %>% table %>% data.frame %>% filter(Freq<5) %>% select(".") %>% unlist %>% unname),'Other',phylum))
+
+mapfile = mapfile %>% select(-V2)
+rownames(mapfile) = NULL
+mapfile = mapfile %>% select(family,species,genus,order,class,phylum)
+
+t = ggtree(tree,layout='circular')%<+% mapfile
+t2 = t 
+t3=gheatmap(t2,log10(mdat_xtree_bac_wide_family+min(mdat_xtree_bac_wide_family[mdat_xtree_bac_wide_family>0])), offset=-.5, width=.15)+scale_x_ggtree() +scale_fill_viridis_c()+ geom_tiplab(align = T,aes(color=phylum),size=8) 
+t3$data = t3$data %>% mutate(label2=if_else(isTip==TRUE,'',label))
+t4 = t3 #+ ggtree::geom_text(aes(label=label2),color='red')
+ggsave(plot=t4,'~/Dropbox (Mason Lab)/radx/plots/familytree.pdf',width=20,height=20)
+
+```
+
+```{r}
+# beta div 
+
+
+merged1_sub = xtree_bac %>% dcast(variable ~ species,value.var ='value') %>% column_to_rownames('variable')
+ 
+bray = as.data.frame(as.matrix(vegan::vegdist(merged1_sub))) %>% rownames_to_column('sample_id')
+
+bray_melted = melt(bray) %>% filter(sample_id != variable) %>% select(-sample_id)
+braym = mergedata(bray_melted) %>% distinct
+a = braym %>% filter(grepl('SL',sample_id))
+b = inner_join(a,mdat,by=c('sample_id'='ha_sample_id'))
+c = braym %>% filter(!grepl('SL',sample_id)) %>% mutate(sample_id= gsub('\\.','-',sample_id))
+d = inner_join(c,mdat,by=c('sample_id'='sample_id'))
+braym = bind_rows(b,d) %>% filter(site_name.x == site_name.y)
+
+braym = braym %>% select(sample_id,variable,value,site_name.x,sampling.date.x,month_cyclical.x,LOCATION_TYPE.x)
+
+ggplot(braym %>% filter(value!=0),aes(x = site_name.x, y= value, color = LOCATION_TYPE.x)) + geom_quasirandom() + theme(axis.text.x = element_blank())
+
+braym$site_name_description.x = fct_reorder(braym$site_name_description.x,braym$LOCATION_TYPE.y)
+
+tokeep = braym %>% group_by(site_name_description.x) %>% filter(value ==0) %>% slice_min(sampling.date.y,n=1) %>% select(sample_id) %>% unlist %>% unname %>% unique
+
+braym = braym %>% filter(sample_id %in% tokeep,!is.na(site_name_description.x),value!=0)
+tokeep2 = braym %>% select(sample_id) %>% group_by(sample_id) %>% count %>% filter(n>5) %>% select(sample_id) %>% unlist %>% unname
+braym = braym %>% filter(sample_id %in% tokeep2)
+
+corrs = list()
+for(l in unique(braym$site_name_description.x)){
+  sub = braym %>% filter(site_name_description.x == l)
+  corrs[[l]] = tidy(cor.test(sub$value,sub$month_cyclical.y,method = 'spearman')) %>% mutate(site_name_description.x = l)
+}
+
+corrs = bind_rows(corrs)
+braym = left_join(braym,corrs)
+
+ggplot(braym,aes(x=sampling.date.y,y=value)) + geom_line() + facet_wrap(facets = vars(site_name_description.x),ncol=2)
+ggsave('bray_from_baseline_allsites_vir.pdf',width=15,height=10)
+
+ggplot(braym %>% filter(LOCATION_TYPE.y == 'DORMITORY' | LOCATION_TYPE.y == 'WASTEWATER TREATMENT PLANT'),aes(x=sampling.date.y,y=value,group = site_name_description.x)) + geom_line() + facet_wrap(facets = vars(site_name_description.x),ncol=2)
+```
+
+```{r}
+# bracken species
+foo = brackout_num_king %>% select(superkingdom,variable,value) %>% group_by(superkingdom,variable) %>% summarise(value = sum(value))
+
+# load root data
+rootdata = read.table('~/Dropbox (Mason Lab)/radx/read_counts_samples',sep='\t')
+
+data1 = rootdata %>% filter(grepl('SL',V1))
+merged1 = inner_join(data1,mdat,by=c('V1'='ha_sample_id'))
+data2 = rootdata %>% filter(!grepl('SL',V1)) %>% mutate(V1= gsub('\\.','-',V1))%>% mutate(V1=gsub('_B06','',V1))
+merged2 = inner_join(data2,mdat,by=c('V1'='sample_id'))
+
+rootdata = bind_rows(merged1,merged2) %>% select(V1,V2,sampling.date) %>% rename(variable=V1)
+
+brackout_num_king_mdat = inner_join(foo,rootdata)
+
+missingdat =  brackout_num_king_mdat %>% group_by(sampling.date,variable,V2) %>% summarise(value = sum(value)) %>% mutate(value = (V2 - value)) %>% ungroup %>% select(variable,value,V2,sampling.date) %>% mutate(superkingdom = 'Not in database')
+
+brackout_num_king_mdat = bind_rows(brackout_num_king_mdat %>% select(superkingdom,variable,value,V2,sampling.date),missingdat) %>% mutate(Fraction = value/V2)
+
+ggplot(brackout_num_king_mdat,aes(x = reorder(variable,sampling.date),y=Fraction,fill=superkingdom)) + geom_bar(stat='identity')  + theme(axis.text.x = element_blank()) + ylab('Aligned reads') + xlab('')  
+ggsave('~/Dropbox (Mason Lab)/radx/plots/summary_overview.pdf',width=10,height=8)
+
+brackout_num_king_mdat$superkingdom = tolower(brackout_num_king_mdat$superkingdom)
+brackout_num_king_mdat$superkingdom[brackout_num_king_mdat$superkingdom=='eukaryota'] = "fungi/eukaryota (not human)"
+
+taxaCol = c("sars_cov2" = "#ae017e", "human" = "#6797CB", "fungi/eukaryota (not human)" = "#53BA98", "bacteria" = "#B77350", "archaea" = "#B09C42",  "viruses" = "#C5688E", "not in database"="#999999")
+
+
+theme_jon = theme_linedraw() + 
+  theme(strip.background=element_rect(fill="grey80", colour="grey50", size=0.2), strip.text.x=element_text(colour="black"), strip.text.y=element_text(colour="black")) +
+  theme(legend.position="bottom", 
+        legend.title=element_text(size=11), 
+        legend.text=element_text(size=10), 
+        axis.text.x = element_text(size=10, angle=90, hjust=1, vjust=0.5), 
+        axis.text.y=element_text(size=10), 
+        axis.title=element_text(size=12), 
+        axis.title.y=element_text(vjust=1), 
+        plot.title = element_text(size=10, hjust = 0.5), 
+        strip.text = element_text(size=12), 
+        panel.grid.major = element_line(colour = "grey98"), 
+        panel.grid.minor = element_blank())
+
+ggplot(brackout_num_king_mdat,aes(x = reorder(variable,sampling.date),y=Fraction,fill=superkingdom)) + 
+  geom_bar(stat="identity", position="stack") + 
+  geom_hline(yintercept = 0) +
+  theme_jon + 
+  theme(axis.text.x = element_blank(),#element_text(size=11),
+        axis.ticks.x = element_blank(),
+        plot.margin = unit(c(0, 1, 0, 1), "cm"),
+        legend.position="none") +
+  scale_fill_manual(values=taxaCol) + scale_color_manual(values=taxaCol) +
+  xlab("") + ylab("Fraction\n") + 
+  scale_y_continuous(breaks=c(0.001, 0.01, 0.1, 0.5, 0.75, 1)) + coord_trans(y="sqrt")#+ scale_y_continuous(breaks=c(0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 1)) +  coord_trans(y="sqrt")
+
+ggsave('~/Dropbox (Mason Lab)/radx/plots/summary_overview.pdf',width=11,height=3)
+
+xbacc = read.delim('~/Dropbox (Mason Lab)/radx/data_packet_feb23/xtree/bacterial/GTDB_metatranscriptomics_species_rawcounts.tsv')
+xvirc = read.delim('~/Dropbox (Mason Lab)/radx/data_packet_feb23/xtree/viral//vir_metatranscriptomics_species_rawcounts.tsv')
+xeukc = read.delim('~/Dropbox (Mason Lab)/radx/data_packet_feb23/xtree/euk/euk_metatranscriptomics_species_rawcounts.tsv')
+
+
+
+```
+
+```{r}
+### top bacteria -- kraken, xtree, metaphlan
+
+mergedata <- function(data){
+  data1 = data %>% filter(grepl('SL',variable))
+  merged1 = inner_join(data1,mdat,by=c('variable'='ha_sample_id'))
+  data2 = data %>% filter(!grepl('SL',variable)) %>% mutate(variable= gsub('\\.','-',variable))
+  merged2 = inner_join(data2,mdat,by=c('variable'='sample_id'))
+  merged1 = bind_rows(merged1,merged2) %>% filter(site_name_description!='n/a')
+  return(merged1)
+}
+
+plotheatmap <- function(data,tag){
+  merged = mergedata(data) %>% filter(species != "Homo sapiens")
+  data_means = merged %>% group_by(LOCATION_TYPE,species) %>% summarise(value = mean(value))%>% slice_max(abs(value),n=20) %>% ungroup %>% select(species) %>% unique %>% distinct %>% unlist %>% unname
+  
+  data_top_toplot = merged %>% dcast(variable ~ species,value.var = 'value') %>% select(variable,all_of(data_means)) %>% column_to_rownames('variable') %>% t %>% data.frame(check.names = F)
+  
+  data_top_annotation = merged %>% select(variable,sampling.date,LOCATION_TYPE) %>% distinct %>% arrange(LOCATION_TYPE,sampling.date) %>% column_to_rownames('variable')
+  
+  data_top_toplot = data_top_toplot %>% select(all_of(rownames(data_top_annotation)))
+  
+  data_top_toplot_m = melt((data_top_toplot) %>% rownames_to_column('taxa'))
+  data_top_toplot_m$value[data_top_toplot_m$value > 0]=1
+  p = data_top_toplot_m %>% select(-variable) %>% group_by(taxa) %>% mutate(prev = sum(value)) %>% select(-value) %>% ungroup %>% distinct %>%column_to_rownames("taxa") %>% filter(prev>0)
+  
+  data_top_toplot = data_top_toplot[rownames(p),]
+  
+  ra= rowAnnotation(Prevalence = anno_barplot(p$prev))
+  colha = columnAnnotation(`Site Type` = data_top_annotation$LOCATION_TYPE)
+  
+  colstokeep = colnames(data_top_toplot)
+
+  col_fun = colorRamp2(c(-8,-6,-4,-2,0), c("black","blue","green","orange","red"))
+    
+  pdf(paste('~/Dropbox (Mason Lab)/radx/plots/toporgheatmap_',tag,'.pdf',sep=''),width=6,height=4)
+  draw(Heatmap(left_annotation = ra,cluster_rows =T, col = col_fun,log10(data_top_toplot+0.00000001),show_row_names = T,show_column_names = F,cluster_column_slices = F, column_split = data_top_annotation$LOCATION_TYPE,column_title_gp = gpar(fontsize = 8),row_names_gp = gpar(fontsize = 9)))
+  dev.off()
+    
+  # regress
+  output = list()
+  minval = min(merged$value[merged$value>0])
+  toregress = merged %>% select(species,value) %>% group_by(species) %>% mutate(value = if_else(value>0,1,0),prev = sum(value)) %>% select(-value) %>% ungroup %>% distinct %>%column_to_rownames("species")%>% filter(prev>50) %>% rownames
+  for(x in toregress){
+    print(x)
+    sub = merged %>% filter(species == x)
+    sub$newval = log(sub$value+minval)
+    sub$LOCATION_TYPE = factor(sub$LOCATION_TYPE,levels = c('Wastewater Treatment Plant','University Campus','Dormitory','Hospital/Medical Campus'))
+    sub = sub %>% mutate(value = 1)  %>% spread(LOCATION_TYPE, value,  fill = 0 )  #%>% mut
+    output[[paste(x,1,1)]]=glm(data = sub, newval ~ `Wastewater Treatment Plant` ) %>% tidy %>% filter(term != '(Intercept)') %>% mutate(term = gsub('LOCATION_TYPE','',term),microbe = x,class = tag)
+    output[[paste(x,1,2)]]=glm(data = sub, newval ~ `University Campus`) %>% tidy %>% filter(term != '(Intercept)') %>% mutate(term = gsub('LOCATION_TYPE','',term),microbe = x,class = tag)
+    output[[paste(x,1,3)]]=glm(data = sub, newval ~ `University Campus`) %>% tidy %>% filter(term != '(Intercept)') %>% mutate(term = gsub('LOCATION_TYPE','',term),microbe = x,class = tag)
+    output[[paste(x,1,4)]]=glm(data = sub, newval ~ `Dormitory`) %>% tidy %>% filter(term != '(Intercept)') %>% mutate(term = gsub('LOCATION_TYPE','',term),microbe = x,class = tag)
+    output[[paste(x,1,5)]]=glm(data = sub, newval ~ `Hospital/Medical Campus`) %>% tidy %>% filter(term != '(Intercept)') %>% mutate(term = gsub('LOCATION_TYPE','',term),microbe = x,class = tag)
+    output[[paste(x,2)]]=glm(data = sub, newval ~ as.numeric(fecal_bacteria_cfu_ml))%>% tidy%>% filter(term != '(Intercept)') %>% mutate(term = gsub('LOCATION_TYPE','',term),microbe = x,class = tag)
+    output[[paste(x,3)]]=glm(data = sub %>% filter(POPSIZE!=0), newval ~ as.numeric(POPSIZE))%>% tidy%>% filter(term != '(Intercept)') %>% mutate(term = gsub('LOCATION_TYPE','',term),microbe = x,class = tag)
+    output[[paste(x,4)]]=glm(data = sub, newval ~ as.numeric(sars_cov_2_n_copies_l))%>% tidy%>% filter(term != '(Intercept)') %>% mutate(term = gsub('LOCATION_TYPE','',term),microbe = x,class = tag)
+    #output[[paste(x,5)]]=glm(data = sub, newval ~ as.numeric(salinity_ppt))%>% tidy%>% filter(term != '(Intercept)') %>% mutate(term = gsub('LOCATION_TYPE','',term),microbe = x,class = tag)
+    output[[paste(x,6)]]=glm(data = sub, newval ~ as.numeric(ph_field))%>% tidy%>% filter(term != '(Intercept)') %>% mutate(term = gsub('LOCATION_TYPE','',term),microbe = x,class = tag)
+    output[[paste(x,7)]]=glm(data = sub, newval ~ as.numeric(dissolved_oxygen_mg_l))%>% tidy%>% filter(term != '(Intercept)') %>% mutate(term = gsub('LOCATION_TYPE','',term),microbe = x,class = tag)
+   # output[[paste(x,8)]]=glm(data = sub, newval ~ as.numeric(humidity_percent))%>% tidy%>% filter(term != '(Intercept)') %>% mutate(term = gsub('LOCATION_TYPE','',term),microbe = x,class = tag)
+    output[[paste(x,9)]]=glm(data = sub, newval ~ as.numeric(specific_conductivity_µs_cm))%>% tidy%>% filter(term != '(Intercept)') %>% mutate(term = gsub('LOCATION_TYPE','',term),microbe = x,class = tag)
+  #  output[[paste(x,10)]]=glm(data = sub, newval ~ as.numeric(month_cyclical))%>% tidy%>% filter(term != '(Intercept)') %>% mutate(term = gsub('LOCATION_TYPE','',term),microbe = x,class = tag)
+  }
+  output = bind_rows(output) %>% mutate(BH = p.adjust(p.value),BY = p.adjust(p.value,method = 'BY'))
+  output$term = gsub('as.numeric\\(','',output$term)
+  output$term = gsub('\\)','',output$term)
+  output$term = gsub("`",'',output$term)
+  return(output)
+}
+
+metaphreg = plotheatmap(metaph,'metaphlan')
+xtreebacreg = plotheatmap(xtree_bac,'xtree_bac')
+xtreevirreg = plotheatmap(xtree_vir,'xtree_vir')
+#xtreeeukreg = plotheatmap(xtree_euk,'xtree_euk')
+brackreg_bac = plotheatmap(brackout_frac_bac,'bac-kraken')
+brackreg_vir = plotheatmap(brackout_frac_vir,'vir-kraken')
+brackreg_euk = plotheatmap(brackout_frac_euk,'euk-kraken')
+
+write.csv(metaphreg,'~/Dropbox (Mason Lab)/radx/regressionoutput/metaphlan_reg.csv')
+write.csv(xtreebacreg,'~/Dropbox (Mason Lab)/radx/regressionoutput/xtreebac_reg.csv')
+write.csv(xtreevirreg,'~/Dropbox (Mason Lab)/radx/regressionoutput/xtreevir_reg.csv')
+write.csv(xtreevirreg,'~/Dropbox (Mason Lab)/radx/regressionoutput/xtreevir_reg.csv')
+write.csv(brackreg_bac,'~/Dropbox (Mason Lab)/radx/regressionoutput/kraken_bac_reg.csv')
+write.csv(brackreg_vir,'~/Dropbox (Mason Lab)/radx/regressionoutput/kraken_vir_reg.csv')
+write.csv(brackreg_euk,'~/Dropbox (Mason Lab)/radx/regressionoutput/kraken_euk_reg.csv')
+
+### VOLC AND TOP -- BACTERIA
+toplot = bind_rows(xtreebacreg,metaphreg,brackreg_bac)%>% group_by(class) %>% mutate(label = if_else(abs(estimate)>quantile(abs(estimate),.9) & BH<0.05,microbe,NA)) %>% mutate(direction = if_else(estimate>0,'positive','negative')) %>% filter(term!='salinity_ppt')
+toplot$term = factor(toplot$term,levels=c('Hospital/Medical Campus','Dormitory',"University Campus","Wastewater Treatment Plant",'fecal_bacteria_cfu_ml','ph_field','POPSIZE','specific_conductivity_µs_cm',"dissolved_oxygen_mg_l","humidity_percent","month_cyclical","sars_cov_2_n_copies_l"))
+toplot$class = factor(toplot$class,levels=c('xtree_bac','metaphlan','bac-kraken'))
+ggplot(data = toplot,aes(x = estimate,y=-log10(p.value),label=label)) + geom_point(size=2)  + facet_grid(class ~ term,scales='free_y') + theme_bw() + geom_hline(yintercept = -log10(0.05),linetype='dashed',color='red') + geom_vline(xintercept = 0,color='gray')+ theme_minimal()
+ggsave('~/Dropbox (Mason Lab)/radx/plots/volcano_plot_everything_BAC.pdf',width=12,height=6)
+
+cats = c('Hospital/Medical Campus','Dormitory',"University Campus","Wastewater Treatment Plant")
+
+ints = c('fecal_bacteria_cfu_ml','ph_field','POPSIZE','specific_conductivity_µs_cm',"dissolved_oxygen_mg_l","humidity_percent","month_cyclical","sars_cov_2_n_copies_l")
+
+ggplot(data = toplot %>% filter(term %in% cats),aes(x = estimate,y=-log10(BH),label=label)) + geom_point(size=2)  + facet_grid(class ~ term,scales='free_y') + theme_bw() + geom_hline(yintercept = -log10(0.05),linetype='dashed',color='red') + geom_vline(xintercept = 0,color='gray')+ theme_minimal()
+ggsave('~/Dropbox (Mason Lab)/radx/plots/volcano_plot_cats_BAC.pdf',width=12,height=6)
+
+ggplot(data = toplot %>% filter(term %in% ints),aes(x = estimate,y=-log10(BH),label=label)) + geom_point(size=2)  + facet_grid(class ~ term,scales='free') + theme_bw() + geom_hline(yintercept = -log10(0.05),linetype='dashed',color='red') + geom_vline(xintercept = 0,color='gray')+ theme_minimal()
+ggsave('~/Dropbox (Mason Lab)/radx/plots/volcano_plot_ints_BAC.pdf',width=12,height=6)
+
+### GIANT SUPER PLOT top hits
+
+a = toplot %>% filter(BH<0.05) %>%  group_by(term,class) %>% slice_max(estimate,n=5)
+b = toplot %>% filter(BH<0.05) %>%  group_by(term,class) %>% slice_min(estimate,n=5)
+
+toplot2 = bind_rows(a,b)
+
+ggplot(toplot2 %>% filter(class == 'xtree_bac'),aes(x = reorder_within(microbe,estimate,term), y= estimate))+ geom_bar(stat='identity',color='black') + facet_grid(.~ term,scales='free',space='free')  +theme_minimal()+ theme(axis.text.x = element_text(hjust=1,angle=60)) + scale_x_reordered()+ ylab('') + geom_errorbar(aes(ymin = estimate - std.error,ymax = estimate + std.error),width=.3)
+ggsave('~/Dropbox (Mason Lab)/radx/plots/top_hits_all_associations_xtree_BAC.pdf',width=12,height=6)
+
+ggplot(toplot2 %>% filter(class == 'metaphlan'),aes(x = reorder_within(microbe,estimate,term), y= estimate))+ geom_bar(stat='identity',color='black') + facet_grid(.~ term,scales='free',space='free')  +theme_minimal()+ theme(axis.text.x = element_text(hjust=1,angle=60)) + scale_x_reordered()+ ylab('') + geom_errorbar(aes(ymin = estimate - std.error,ymax = estimate + std.error),width=.3)
+ggsave('~/Dropbox (Mason Lab)/radx/plots/top_hits_all_associations_metaph_BAC.pdf',width=12,height=6)
+
+ggplot(toplot2 %>% filter(class == 'bac-kraken'),aes(x = reorder_within(microbe,estimate,term), y= estimate))+ geom_bar(stat='identity',color='black') + facet_grid(.~ term,scales='free',space='free')  +theme_minimal()+ theme(axis.text.x = element_text(hjust=1,angle=60)) + scale_x_reordered()+ ylab('') + geom_errorbar(aes(ymin = estimate - std.error,ymax = estimate + std.error),width=.3)
+ggsave('~/Dropbox (Mason Lab)/radx/plots/top_hits_all_associations_krak_BAC.pdf',width=12,height=6)
+
+### VOLC AND TOP -- BACTERIA
+toplot = bind_rows(xtreevirreg,brackreg_vir)%>% group_by(class) %>% mutate(label = if_else(abs(estimate)>quantile(abs(estimate),.9) & BH<0.05,microbe,NA)) %>% mutate(direction = if_else(estimate>0,'positive','negative')) %>% filter(term!='salinity_ppt')
+toplot$term = factor(toplot$term,levels=c('Hospital/Medical Campus','Dormitory',"University Campus","Wastewater Treatment Plant",'fecal_bacteria_cfu_ml','ph_field',"POPSIZE",'specific_conductivity_µs_cm',"dissolved_oxygen_mg_l","humidity_percent","month_cyclical","sars_cov_2_n_copies_l"))
+toplot$class = factor(toplot$class,levels=c('xtree_vir','vir-kraken'))
+ggplot(data = toplot,aes(x = estimate,y=-log10(p.value),label=label)) + geom_point(size=2)  + facet_grid(class ~ term,scales='free_y') + theme_bw() + geom_hline(yintercept = -log10(0.05),linetype='dashed',color='red') + geom_vline(xintercept = 0,color='gray')+ theme_minimal()
+ggsave('~/Dropbox (Mason Lab)/radx/plots/volcano_plot_everything_VIR.pdf',width=12,height=6)
+
+### GIANT SUPER PLOT top hits
+
+a = toplot %>% filter(BH<0.05) %>%  group_by(term,class) %>% slice_max(estimate,n=5)
+b = toplot %>% filter(BH<0.05) %>%  group_by(term,class) %>% slice_min(estimate,n=5)
+
+toplot2 = bind_rows(a,b)
+
+
+ggplot(toplot2 %>% filter(class == 'xtree_vir'),aes(x = reorder_within(microbe,estimate,term), y= estimate))+ geom_bar(stat='identity',color='black') + facet_grid(.~ term,scales='free',space='free')  +theme_minimal()+ theme(axis.text.x = element_text(hjust=1,angle=60)) + scale_x_reordered()+ ylab('') + geom_errorbar(aes(ymin = estimate - std.error,ymax = estimate + std.error),width=.3)
+ggsave('~/Dropbox (Mason Lab)/radx/plots/top_hits_all_associations_xtree_VIR.pdf',width=12,height=6)
+
+ggplot(toplot2 %>% filter(class == 'vir-kraken'),aes(x = reorder_within(microbe,estimate,term), y= estimate))+ geom_bar(stat='identity',color='black') + facet_grid(.~ term,scales='free',space='free')  +theme_minimal()+ theme(axis.text.x = element_text(hjust=1,angle=60)) + scale_x_reordered()+ ylab('') + geom_errorbar(aes(ymin = estimate - std.error,ymax = estimate + std.error),width=.3)
+ggsave('~/Dropbox (Mason Lab)/radx/plots/top_hits_all_associations_metaph_VIR.pdf',width=12,height=6)
+
+#### TOP HIT PLOTS FOR LOC
+maxes = xtreebacreg %>% filter(BH<0.05,estimate>0) %>% group_by(term) %>% slice_max(estimate,n=25) 
+mins = brackreg_bac %>% filter(BH<0.05,estimate<0) %>% group_by(term) %>% slice_min(estimate,n=25)
+dat = bind_rows(maxes) %>% mutate(key = paste(term,microbe))
+dat$term = factor(dat$term,levels=c('Hospital/Medical Campus','Dormitory',"University Campus","Wastewater Treatment Plant",'fecal_bacteria_cfu_ml','ph_field',"POPSIZE",'salinity_ppt','specific_conductivity_µs_cm',"dissolved_oxygen_mg_l"))
+dat1 = dat %>% filter(term %in% c('Hospital/Medical Campus','Dormitory',"University Campus","Wastewater Treatment Plant"))
+ggplot(dat1,aes(x = reorder_within(microbe,estimate,term), y= estimate))+ geom_bar(stat='identity',color='black') + facet_grid(. ~ term,scales='free',space='free')  +theme_minimal()+ theme(axis.text.x = element_text(hjust=1,angle=60)) + scale_x_reordered()+ ylab('') + geom_errorbar(aes(ymin = estimate - std.error,ymax = estimate + std.error),width=.3)
+ggsave('~/Dropbox (Mason Lab)/radx/plots/tophits_loc_xtreeback.pdf',width=14,height=3) 
+
+maxes = xtreevirreg %>% filter(BH<0.05,estimate>0) %>% group_by(term) %>% slice_max(estimate,n=25)
+#mins = brackreg_bac %>% filter(BH<0.05,estimate<0) %>% group_by(term) %>% slice_min(estimate,n=10)
+dat = bind_rows(maxes) %>% mutate(key = paste(term,microbe))
+dat$term = factor(dat$term,levels=c('Hospital/Medical Campus','Dormitory',"University Campus","Wastewater Treatment Plant",'fecal_bacteria_cfu_ml','ph_field',"POPSIZE",'salinity_ppt','specific_conductivity_µs_cm',"dissolved_oxygen_mg_l"))
+dat1 = dat %>% filter(term %in% c('Hospital/Medical Campus','Dormitory',"University Campus","Wastewater Treatment Plant"))
+ggplot(dat1,aes(x = reorder_within(microbe,estimate,term), y= estimate)) + geom_bar(stat='identity') + theme_bw() + facet_grid(. ~ term,scales='free',space='free') + theme(axis.text.x = element_text(hjust=1,angle=60)) + scale_x_reordered()+ ylab('') + geom_errorbar(aes(ymin = estimate - std.error,ymax = estimate + std.error),width=.3)
+ggsave('~/Dropbox (Mason Lab)/radx/plots/tophits_loc_xtreevir.pdf',width=8,height=10) 
+
+maxes = brackreg_euk %>% filter(BH<0.05) %>% group_by(term) #%>% slice_max(estimate,n=25)
+#mins = brackreg_bac %>% filter(BH<0.05,estimate<0) %>% group_by(term) %>% slice_min(estimate,n=10)
+dat = bind_rows(maxes) %>% mutate(key = paste(term,microbe))
+dat$term = factor(dat$term,levels=c('Hospital/Medical Campus','Dormitory',"University Campus","Wastewater Treatment Plant",'fecal_bacteria_cfu_ml','ph_field',"POPSIZE",'salinity_ppt','specific_conductivity_µs_cm',"dissolved_oxygen_mg_l"))
+dat1 = dat %>% filter(term %in% c('Hospital/Medical Campus','Dormitory',"University Campus","Wastewater Treatment Plant"))
+ggplot(dat1,aes(x = reorder_within(microbe,estimate,term), y= estimate)) + geom_bar(stat='identity') + theme_bw() + facet_grid(. ~ term,scales='free',space='free') + theme(axis.text.x = element_text(hjust=1,angle=60)) + scale_x_reordered()+ ylab('') + geom_errorbar(aes(ymin = estimate - std.error,ymax = estimate + std.error),width=.3)
+ggsave('~/Dropbox (Mason Lab)/radx/plots/tophits_loc_eukkrak.pdf',width=4,height=3)  
+
+
+### POP SIZE HITS
+
+#### TOP HIT PLOTS FOR LOC
+maxes = xtreebacreg %>% filter(BH<0.05,estimate>0) %>% group_by(term) %>% slice_max(estimate,n=25) %>% filter(term == 'POPSIZE')
+mins = xtreebacreg %>% filter(BH<0.05,estimate<0) %>% group_by(term) %>% slice_min(estimate,n=25) %>% filter(term == 'POPSIZE')
+dat = bind_rows(maxes,mins) %>% mutate(key = paste(term,microbe))
+dat$term = factor(dat$term,levels=c('Hospital/Medical Campus','Dormitory',"University Campus","Wastewater Treatment Plant",'fecal_bacteria_cfu_ml','ph_field',"POPSIZE",'salinity_ppt','specific_conductivity_µs_cm',"dissolved_oxygen_mg_l"))
+ggplot(dat,aes(x = reorder_within(microbe,estimate,term), y= estimate))+ geom_bar(stat='identity',color='black')  +theme_minimal()+ theme(axis.text.x = element_text(hjust=1,angle=60)) + scale_x_reordered()+ ylab('Beta coefficient') + geom_errorbar(aes(ymin = estimate - std.error,ymax = estimate + std.error),width=.3) + ggtitle('Associations with represented population size') + xlab('Species')
+ggsave('~/Dropbox (Mason Lab)/radx/plots/tophits_loc_xtreeback_POPSIZE.pdf',width=13,height=3) 
+
+```
+
+
+```{r}
+# prevalence/core express-ome
+
+plotheatmap4 <- function(data,tag,slist){
+  merged = mergedata(data) %>% filter(species != "Homo sapiens") %>% filter(species %in% slist)
+  data_means = merged %>% group_by(LOCATION_TYPE,species) %>% summarise(value = mean(value))%>% slice_max(abs(value),n=10) %>% ungroup %>% select(species) %>% unique %>% distinct %>% unlist %>% unname
+  
+ #if(length(data_means)>50){
+  #   data_means = merged %>% group_by(LOCATION_TYPE,species) %>% summarise(value = mean(value))%>% slice_max(abs(value),n=5) %>% ungroup %>% select(species) %>% unique %>% distinct %>% unlist %>% unname
+ #}
+  data_top_toplot = merged %>% dcast(variable ~ species,value.var = 'value') %>% select(variable,all_of(data_means)) %>% column_to_rownames('variable') %>% t %>% data.frame(check.names = F)
+  
+  data_top_annotation = merged %>% select(variable,sampling.date,LOCATION_TYPE) %>% distinct %>% arrange(LOCATION_TYPE,sampling.date) %>% column_to_rownames('variable')
+  
+  data_top_toplot = data_top_toplot %>% select(all_of(rownames(data_top_annotation)))
+  
+  data_top_toplot_m = melt((data_top_toplot) %>% rownames_to_column('taxa'))
+  data_top_toplot_m$value[data_top_toplot_m$value > 0]=1
+  p = data_top_toplot_m %>% select(-variable) %>% group_by(taxa) %>% mutate(prev = sum(value)) %>% select(-value) %>% ungroup %>% distinct %>%column_to_rownames("taxa") %>% filter(prev>0)
+  
+  data_top_toplot = data_top_toplot[rownames(p),]
+  
+  ra= rowAnnotation(Prevalence = anno_barplot(p$prev))
+  colha = columnAnnotation(`Site Type` = data_top_annotation$LOCATION_TYPE)
+  
+  colstokeep = colnames(data_top_toplot)
+  
+  col_fun = colorRamp2(c(-8,-6,-4,-2,0), c("black","blue","green","orange","red"))
+
+  #pdf(paste('~/Dropbox (Mason Lab)/radx/plots/toporgheatmap_comrar_',tag,'.pdf',sep=''),width=8,height=4)
+  foo = draw(Heatmap(left_annotation = ra,cluster_rows =T,log10(data_top_toplot+0.00000001),show_row_names = T,show_column_names = F,column_split = data_top_annotation$LOCATION_TYPE,col=col_fun,show_heatmap_legend = F,column_title_gp = gpar(fontsize = 8),cluster_column_slices = F,row_names_gp = gpar(fontsize = 9)))
+  #dev.off()
+  return(foo)
+}
+
+getprev <- function(dat){
+  dat2 = mergedata(dat)
+  loccounts = dat2 %>% select(LOCATION_TYPE,variable) %>% distinct %>% select(-variable) %>% table %>% data.frame %>% rename(LOCATION_TYPE = ".")
+  countsdat = dat2 %>% filter(value>0) %>% select(LOCATION_TYPE,species,sample_id) %>% group_by(LOCATION_TYPE,species) %>% count
+  countsdat = left_join(countsdat,loccounts) %>% mutate(prop = n/Freq)
+}
+
+xtree_bac_prev = getprev(xtree_bac)
+xtree_vir_prev = getprev(xtree_vir)
+
+xtree_bac_prev$LOCATION_TYPE = factor(xtree_bac_prev$LOCATION_TYPE,level= c("Hospital/Medical Campus",'Dormitory',"University Campus","Wastewater Treatment Plant"))
+xtree_vir_prev$LOCATION_TYPE = factor(xtree_vir_prev$LOCATION_TYPE,level= c("Hospital/Medical Campus",'Dormitory',"University Campus","Wastewater Treatment Plant"))
+
+ggplot(xtree_bac_prev,aes(x=prop*100)) + geom_histogram(alpha=.8,bins=30) + xlab('') + facet_grid(LOCATION_TYPE~.) + theme_minimal() +geom_vline(xintercept = 10,linetype= 'dashed')+geom_vline(xintercept = 90,linetype= 'dashed')+ theme(legend.position = 'None')
+ggsave('~/Dropbox (Mason Lab)/radx/plots/xtree_bac_prev.pdf',width=5,height=4)
+ggplot(xtree_vir_prev,aes(x=prop*100)) + geom_histogram(alpha=.8,bins=30) + xlab('') + facet_grid(LOCATION_TYPE~.) + theme_minimal() +geom_vline(xintercept = 10,linetype= 'dashed')+geom_vline(xintercept = 90,linetype= 'dashed') + theme(legend.position = 'None')
+ggsave('~/Dropbox (Mason Lab)/radx/plots/xtree_vir_prev.pdf',width=5,height=4)
+
+allbac = xtree_bac_prev %>% mutate(prop = if_else(prop>0,1,0)) %>% dcast(species ~ LOCATION_TYPE,value.var = "prop")
+allbac[is.na(allbac)] = 0  
+commbac = xtree_bac_prev %>% filter(prop>.9) %>% mutate(prop = if_else(prop>0,1,0)) %>% dcast(species ~ LOCATION_TYPE,value.var = "prop")
+commbac[is.na(commbac)] = 0  
+
+allvir = xtree_vir_prev %>% mutate(prop = if_else(prop>0,1,0)) %>% dcast(species ~ LOCATION_TYPE,value.var = "prop")
+allvir[is.na(allvir)] = 0  
+commvir = xtree_vir_prev %>% filter(prop>.9) %>% mutate(prop = if_else(prop>0,1,0)) %>% dcast(species ~ LOCATION_TYPE,value.var = "prop")
+commvir[is.na(commvir)] = 0  
+
+rarebac = xtree_bac_prev %>% filter(prop<.1) %>% mutate(prop = if_else(prop>0,1,0)) %>% dcast(species ~ LOCATION_TYPE,value.var = "prop")
+rarebac[is.na(rarebac)] = 0  
+rarevir = xtree_vir_prev %>% arrange(desc(prop))%>% filter(prop<.1) %>% mutate(prop = if_else(prop>0,1,0)) %>% dcast(species ~ LOCATION_TYPE,value.var = "prop")
+rarevir[is.na(rarevir)] = 0  
+
+# upsetR plots comparing core genomes
+pdf('~/Dropbox (Mason Lab)/radx/plots/allbacup.pdf',width=5.5,height=4)
+ComplexUpset::upset(allbac,intersect = colnames(allbac)[2:5],set_sizes = F, sort_sets=FALSE)
+dev.off()
+pdf('~/Dropbox (Mason Lab)/radx/plots/combacup.pdf',width=5.5,height=4)
+ComplexUpset::upset(commbac,intersect = colnames(commbac)[2:5],set_sizes = F, sort_sets=FALSE)
+dev.off()
+pdf('~/Dropbox (Mason Lab)/radx/plots/rarebacup.pdf',width=5.5,height=4)
+ComplexUpset::upset(rarebac,intersect = colnames(rarebac)[2:5],set_sizes = F, sort_sets=FALSE)
+dev.off()
+
+## GET SUMMARIES
+
+a = commbac %>% column_to_rownames('species') %>% rowSums %>% data.frame() %>% mutate(prevalence = 'High prevalence (within site type)')%>% rename("Number of site types found in"= ".")
+b= rarebac %>% column_to_rownames('species') %>% rowSums %>% data.frame() %>% mutate(prevalence = 'Low prevalence (within site type)') %>% rename("Number of site types found in"= ".")
+c = bind_rows(a,b)
+
+write.csv(c,'~/Dropbox (Mason Lab)/radx/plots/bacterial_prevalence.csv')
+
+####
+
+pdf('~/Dropbox (Mason Lab)/radx/plots/allvirup.pdf',width=5.5,height=4)
+ComplexUpset::upset(allvir,intersect = colnames(allvir)[2:5],set_sizes = F, sort_sets=FALSE)
+dev.off()
+pdf('~/Dropbox (Mason Lab)/radx/plots/comvirup.pdf',width=5.5,height=4)
+ComplexUpset::upset(commvir,intersect = colnames(commvir)[2:5],set_sizes = F, sort_sets=FALSE)
+dev.off()
+pdf('~/Dropbox (Mason Lab)/radx/plots/rarevirup.pdf',width=5.5,height=4)
+ComplexUpset::upset(rarevir,intersect = colnames(rarevir)[2:5],set_sizes = F, sort_sets=FALSE)
+dev.off()
+
+
+a = commvir %>% column_to_rownames('species') %>% rowSums %>% data.frame() %>% mutate(prevalence = 'High prevalence (within site type)')%>% rename("Number of site types found in"= ".")
+b= rarevir %>% column_to_rownames('species') %>% rowSums %>% data.frame() %>% mutate(prevalence = 'Low prevalence (within site type)') %>% rename("Number of site types found in"= ".")
+c = bind_rows(a,b)
+
+write.csv(c,'~/Dropbox (Mason Lab)/radx/plots/viral_prevalence.csv')
+
+
+# top abundant bac/vir, plot average abundance 
+combaclist = unique(commbac$species)
+commvirlist = unique(commvir$species)
+
+rarebaclist = unique(rarebac$species)
+rarevirlist = unique(rarevir$species)
+
+out1 = plotheatmap4(xtree_bac,'xtree-comm',combaclist)
+out2 = plotheatmap4(xtree_bac,'xtree-rare',rarebaclist)
+out3 = plotheatmap4(xtree_vir,'xtree-comm',commvirlist)
+out4 = plotheatmap4(xtree_vir,'xtree-rare',rarevirlist)
+
+pdf(paste('~/Dropbox (Mason Lab)/radx/plots/toporgheatmap_comrar_','xtreebaccom','.pdf',sep=''),width=7,height=5)
+print(out1)
+dev.off()
+
+pdf(paste('~/Dropbox (Mason Lab)/radx/plots/toporgheatmap_comrar_','xtreebacrare','.pdf',sep=''),width=7,height=5)
+print(out2)
+dev.off()
+
+pdf(paste('~/Dropbox (Mason Lab)/radx/plots/toporgheatmap_comrar_','xtreevircom','.pdf',sep=''),width=7,height=2)
+print(out3)
+dev.off()
+
+pdf(paste('~/Dropbox (Mason Lab)/radx/plots/toporgheatmap_comrar_','xtreevirrare','.pdf',sep=''),width=7,height=8)
+print(out4)
+dev.off()
+
+```
+
+
+```{r}
+# just associations with time 
+
+
+mergedata <- function(data){
+  data1 = data %>% filter(grepl('SL',variable))
+  merged1 = inner_join(data1,mdat,by=c('variable'='ha_sample_id'))
+  data2 = data %>% filter(!grepl('SL',variable)) %>% mutate(variable= gsub('\\.','-',variable))
+  merged2 = inner_join(data2,mdat,by=c('variable'='sample_id'))
+  merged1 = bind_rows(merged1,merged2) %>% filter(site_name_description!='n/a')
+  return(merged1)
+}
+
+plotheatmap3 <- function(data,tag){
+  merged = mergedata(data) %>% filter(species != "Homo sapiens")
+  data_means = merged %>% group_by(LOCATION_TYPE,species) %>% summarise(value = mean(value))%>% slice_max(abs(value),n=20) %>% ungroup %>% select(species) %>% unique %>% distinct %>% unlist %>% unname
+  
+  data_top_toplot = merged %>% dcast(variable ~ species,value.var = 'value') %>% select(variable,all_of(data_means)) %>% column_to_rownames('variable') %>% t %>% data.frame(check.names = F)
+  
+  data_top_annotation = merged %>% select(variable,sampling.date,LOCATION_TYPE) %>% distinct %>% arrange(LOCATION_TYPE,sampling.date) %>% column_to_rownames('variable')
+  
+  data_top_toplot = data_top_toplot %>% select(all_of(rownames(data_top_annotation)))
+  
+  data_top_toplot_m = melt((data_top_toplot) %>% rownames_to_column('taxa'))
+  data_top_toplot_m$value[data_top_toplot_m$value > 0]=1
+  p = data_top_toplot_m %>% select(-variable) %>% group_by(taxa) %>% mutate(prev = sum(value)) %>% select(-value) %>% ungroup %>% distinct %>%column_to_rownames("taxa") %>% filter(prev>0)
+  
+  data_top_toplot = data_top_toplot[rownames(p),]
+ 
+  # regress
+  output = list()
+  minval = min(merged$value[merged$value>0])
+  toregress = data_top_toplot_m %>% select(-variable) %>% group_by(taxa) %>% mutate(prev = sum(value)) %>% select(-value) %>% ungroup %>% distinct %>%column_to_rownames("taxa")%>% filter(prev>3) %>% rownames
+  for(x in toregress){
+    print(x)
+    sub = merged %>% filter(species == x)
+    sub$newval = log(sub$value+minval)
+    sub$LOCATION_TYPE = factor(sub$LOCATION_TYPE,levels = c('Wastewater Treatment Plant',"University Campus" ,"Dormitory" ,"Hospital/Medical Campus"))
+    #sub = sub %>% mutate(value = 1)  %>% spread(LOCATION_TYPE, value,  fill = 0 ) 
+    output[[paste(x,1,1)]]=glm(data = sub, newval ~ as.numeric(month_cyclical):LOCATION_TYPE) %>% tidy %>% filter(term != '(Intercept)') %>% mutate(term = gsub('LOCATION_TYPE','',term),microbe = x,class = tag)
+  }
+  output = bind_rows(output) %>% mutate(BH = p.adjust(p.value),BY = p.adjust(p.value,method = 'BY'))
+  output$term = gsub('as.numeric\\(','',output$term)
+  output$term = gsub('\\)','',output$term)
+  output$term = gsub("`",'',output$term)
+  return(output)
+}
+ 
+
+xtreebacreg = plotheatmap3(xtree_bac,'xtree_bac')
+xtreevirreg = plotheatmap3(xtree_vir,'xtree_vir')
+
+```
+
+```{r}
+### other pathogenic/beneficial bacteria -- kraken
+
+plotheatmap2 <- function(data,tag){
+
+  merged = mergedata(data) %>% filter(species != "Homo sapiens")
+  data_means = merged %>% group_by(LOCATION_TYPE,species) %>% summarise(value = mean(value))%>% slice_max(abs(value),n=20) %>% ungroup %>% select(species) %>% unique %>% distinct %>% unlist %>% unname
+  
+  data_top_toplot = merged %>% dcast(variable ~ species,value.var = 'value') %>% select(variable,all_of(data_means)) %>% column_to_rownames('variable') %>% t %>% data.frame(check.names = F)
+  
+  data_top_annotation = merged %>% select(variable,sampling.date,LOCATION_TYPE) %>% distinct %>% arrange(LOCATION_TYPE,sampling.date) %>% column_to_rownames('variable')
+  
+  data_top_toplot = data_top_toplot %>% select(all_of(rownames(data_top_annotation)))
+  
+  data_top_toplot_m = melt((data_top_toplot) %>% rownames_to_column('taxa'))
+  data_top_toplot_m$value[data_top_toplot_m$value > 0]=1
+  p = data_top_toplot_m %>% select(-variable) %>% group_by(taxa) %>% mutate(prev = sum(value)) %>% select(-value) %>% ungroup %>% distinct %>%column_to_rownames("taxa") %>% filter(prev>0)
+  
+  data_top_toplot = data_top_toplot[rownames(p),]
+  
+  ra= rowAnnotation(Prevalence = anno_barplot(p$prev))
+  colha = columnAnnotation(`Site Type` = data_top_annotation$LOCATION_TYPE)
+  
+  colstokeep = colnames(data_top_toplot)
+  
+  col_fun = colorRamp2(c(-8,-6,-4,-2,0), c("black","blue","green","orange","red"))
+
+  
+  pdf(paste('~/Dropbox (Mason Lab)/radx/plots/pathheatmap_',tag,'.pdf',sep=''),width=6,height=4)
+  draw(Heatmap(left_annotation = ra,cluster_rows =T, col = col_fun,log10(data_top_toplot+0.00000001),show_row_names = T,show_column_names = F,cluster_column_slices = F,column_split = data_top_annotation$LOCATION_TYPE,column_title_rot = 0,column_title_gp = gpar(fontsize = 8),row_names_gp = gpar(fontsize = 9)))
+  dev.off()
+}
+
+pathogens = unique(c("Bartonella henselae","Bartonella quintana","Neisseria meningitidis","Streptococcus pyogenes","Streptococcus pneumoniae","Bordetella pertussis","Haemophilus influenzae","Borrelia burgdorferi","Borrelia garinii","Borrelia afzelii","Borrelia recurrentis","Brucella abortus","Brucella canis","Brucella melitensis","Brucella suis","Campylobacter jejuni","Chlamydia pneumoniae","Chlamydia trachomatis","Chlamydophila psittaci","Clostridium botulinum","Clostridium difficile","Clostridium perfringens","Clostridium tetani","Corynebacterium diphtheriae","Enterococcus faecalis","Enterococcus faecium","Escherichia coli","Francisella tularensis","Haemophilus influenzae","Helicobacter pylori","Legionella pneumophila","Leptospira interrogans","Leptospira santarosai","Leptospira weilii","Leptospira noguchii","Listeria monocytogenes","Mycobacterium leprae","Mycobacterium tuberculosis","Mycobacterium ulcerans","Mycoplasma pneumoniae","Neisseria gonorrhoeae","Neisseria meningitidis","Pseudomonas aeruginosa","Rickettsia rickettsii","Salmonella typhi","Salmonella typhimurium","Shigella sonnei","Staphylococcus aureus","Staphylococcus epidermidis","Staphylococcus saprophyticus","Streptococcus agalactiae","Streptococcus pneumoniae","Streptococcus pyogenes","Treponema pallidum","Ureaplasma urealyticum","Vibrio cholerae","Helicobacter pylori","Fusobacterium nucleatum","Chlamydia trachomatis","Mycoplasma arginini","Mycoplasma hominis","Mycoplasma arthritidis","Aeromonas salmonicidasubsp. salmonicida","Brucella abortus","Brucella melitensis","Brucella suis","Burkholderia mallei","Campylobacter coli","Campylobacter fetus subsp. venerealis","Campylobacter jejuni subsp. jejuni","Campylobacter lari","Campylobacter upsaliensis","Chlamydophila abortus","Chlamydophila psittaci","Clostridium botulinum, group I","Clostridium botulinum, group II","Clostridium botulinum, group III","Clostridium botulinum, group IV","Clostridium chauvoei","Escherichia coli","Francisella tularensis subsp. tularensis","Francisella tularensis subsp. holarctica","Legionella pneumophila subsp. pneumophila","Leptospira borgpetersenii","Leptospira interrogans","Leptospira kirschneri","Listeria monocytogenes","Mycobacterium avium subsp. paratuberculosis","Mycobacterium bovis","Mycobacterium tuberculosis","Mycoplasma capricolum subsp. capripneumoniae","Mycoplasma mycoides subsp. mycoides","Mycoplasmoides gallisepticum","Mycoplasmopsis agalactiae","Mycoplasmopsis meleagridis","Pasteurella multocida subsp. multocida","Renibacterium salmoninarum","Salmonella enterica subsp. enterica","Streptococcus equi subsp. equi","Taylorella equigenitalis","Vibrio alginolyticus","Vibrio cholerae","Vibrio parahaemolyticus","Vibrio vulnificus","Yersinia ruckeri"))
+
+tokeep = brackout_num_bac  %>% filter(species %in% pathogens,value>150)%>% ungroup%>% select(species) %>% unlist %>% unname %>% unique
+
+plotheatmap2(brackout_frac_bac %>% filter(species %in% tokeep) ,'bacpath-kraken')
+plotheatmap2(xtree_bac %>% filter(species %in% pathogens),'bacpath-xtree')
+#brackreg_vir = plotheatmap(brackout_frac_vir,'vir-kraken')
+
+```
+
+```{r}
+# functional analysis
+
+data = read.csv('~/Dropbox (Mason Lab)/radx/data_packet_feb23/bakta/wawa_calledORFs_full_annotation_data.tsv',sep=',')
+data = data %>% mutate(Sample = gsub('_rnaviral','',Sample)) %>% distinct %>% rename(variable = Sample)
+
+goterms = data.frame(list(c('nitrogen fixation','nitrate assimilation','nitrate reduction','mercury ion binding','copper ion binding'),c("GO:0009399","GO:0042128","GO:0019333","GO:0045340","GO:0005507")))
+colnames(goterms) = c('name','term')
+
+subout = list()
+for(c in goterms$term){
+  sub = data %>% filter(grepl(c,DbXrefs)) %>% mutate(term = c,name = goterms$name[goterms$term==c]) %>% select(variable,Gene,Product,term,name)
+  subout[[c]] = sub
+}
+
+subout = bind_rows(subout)
+
+dsm = mergedata(subout) %>% group_by(name,variable,sampling.date) %>% count
+write.csv(dsm,'~/Dropbox (Mason Lab)/radx/figures/metals_nitrogen.csv')
+
+ggplot(data = dsm,aes(x = sampling.date,y = n,color = name)) + geom_quasirandom(size=3) + theme_cowplot() + ylab('count') + ggtitle('Counts of nitrogen/metal associated genes across time') + ylim(0,5)
+
+```
+
+
+
